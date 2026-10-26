@@ -1,6 +1,6 @@
-# PusherHub iOS SDK (Swift)
+# PusherHub iOS SDK (Swift) — iOS push notifications
 
-Push notifications and in-app messages for your iPhone app, sent through your own Firebase project with [PusherHub](https://pusherhub.com).
+Push notifications and in-app messages for your iPhone app: a free push notification service that delivers through the Apple Push Notification service (APNs) and your own Firebase project (Firebase Cloud Messaging), with [PusherHub](https://pusherhub.com).
 
 [Website](https://pusherhub.com) · [Guides](https://pusherhub.com/docs) · [Pricing](https://pusherhub.com/pricing)
 
