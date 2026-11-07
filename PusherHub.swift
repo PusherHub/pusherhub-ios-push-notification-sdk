@@ -1,4 +1,3 @@
-import CoreLocation
 import FirebaseCore
 import FirebaseMessaging
 import Foundation
@@ -40,6 +39,10 @@ import WebKit
  * shows a push's picture when the app ships a Notification Service
  * Extension to download it. NotificationService.swift, next to this file,
  * is that extension, with its setup steps at the top.
+ *
+ * This file never touches the phone's location, so an app needs no location
+ * permission for PusherHub. PusherHubLocation.swift, also next to this file,
+ * is an optional add-on only for an app that already uses location.
  */
 @MainActor
 public final class PusherHub {
@@ -111,8 +114,6 @@ public final class PusherHub {
     private var timezone: String?
     private var state: String?
     private var city: String?
-
-    private var locationResolver: PusherHubLocationResolver?
 
     // Taps on a fresh install the backend doesn't know yet — track-open
     // looks the device up by token. Sent once registration succeeds.
@@ -313,15 +314,16 @@ public final class PusherHub {
      * Safe to call any time after [registerDevice] has completed; skips
      * quietly if called before that.
      *
-     * Location is off by default, and then no location permission is ever
-     * requested — the backend estimates state from the device's IP address
-     * instead. Pass [resolveLocation] true for GPS-accurate state and city;
-     * that prompts for When In Use location access (add
-     * NSLocationWhenInUseUsageDescription to your Info.plist first) and uses
-     * Apple's own geocoder, so no extra dependency or API key is needed. A
-     * denial only costs the location fields.
+     * This file never reads the phone's location, so an app needs no
+     * location permission or NSLocation… text for PusherHub: the backend
+     * finds state and city from the device's IP address. An app that already
+     * uses location can pass [location] for GPS-accurate state and city —
+     * PusherHubLocation.swift, the optional add-on next to this file, gives
+     * one that never asks for permission:
+     *
+     *   PusherHub.collectDeviceMetadata(location: PusherHubLocation.place)
      */
-    public static func collectDeviceMetadata(resolveLocation: Bool = false) {
+    public static func collectDeviceMetadata(location: (@MainActor () async -> PusherHubPlace?)? = nil) {
         let hub = shared
         guard hub.currentToken != nil else {
             log("collectDeviceMetadata() called before registerDevice() completed.")
@@ -343,23 +345,31 @@ public final class PusherHub {
         }
         hub.timezone = TimeZone.current.identifier
 
-        guard resolveLocation else {
+        guard let location else {
             hub.reregister()
             return
         }
 
-        let resolver = PusherHubLocationResolver()
-        hub.locationResolver = resolver
-        resolver.resolve { state, city, country in
-            hub.locationResolver = nil
-            if let state { hub.state = state }
-            if let city { hub.city = city }
+        Task { @MainActor in
+            let place = await location()
+            if let state = place?.state { hub.state = state }
+            if let city = place?.city { hub.city = city }
             // Overrides the locale-based guess above with the real,
             // GPS-derived country — a locale's region is just an OS
             // preference and can be flatly wrong.
-            if let country { hub.country = country }
+            if let country = place?.country { hub.country = country }
             hub.reregister()
         }
+    }
+
+    /// Kept so apps written for the older SDK still build. This file no
+    /// longer reads location itself: see collectDeviceMetadata(location:).
+    @available(*, deprecated, message: "Use collectDeviceMetadata() — or, in an app that already uses location, collectDeviceMetadata(location: PusherHubLocation.place) with PusherHubLocation.swift.")
+    public static func collectDeviceMetadata(resolveLocation: Bool) {
+        if resolveLocation {
+            log("collectDeviceMetadata(resolveLocation:) no longer reads location — add PusherHubLocation.swift and call collectDeviceMetadata(location: PusherHubLocation.place). Until then state and city come from the IP address.")
+        }
+        collectDeviceMetadata()
     }
 
     // MARK: - In-app messages
@@ -885,101 +895,23 @@ private final class PusherHubBackgroundTask {
     }
 }
 
-// MARK: - Location (opt-in)
+// MARK: - Location (from the optional add-on)
 
 /**
- * One When In Use location fix, reverse-geocoded to state/city/country with
- * Apple's own geocoder. Only ever created by
- * collectDeviceMetadata(resolveLocation: true). Always calls its completion
- * exactly once — with nils if permission is denied, location is off, the
- * Info.plist key is missing, or nothing arrives within 15 seconds.
+ * State, city and country from the phone's own location, handed to
+ * PusherHub.collectDeviceMetadata(location:). PusherHubLocation.swift (the
+ * optional add-on, for apps that already use location) makes one; any
+ * other source of the person's place works too.
  */
-@MainActor
-private final class PusherHubLocationResolver: NSObject, CLLocationManagerDelegate {
+public struct PusherHubPlace: Sendable {
+    public var state: String?
+    public var city: String?
+    public var country: String?
 
-    private let manager = CLLocationManager()
-    private let geocoder = CLGeocoder()
-    private var completion: ((_ state: String?, _ city: String?, _ country: String?) -> Void)?
-    private var awaitingAuthorization = false
-    private var timeoutTask: Task<Void, Never>?
-
-    func resolve(completion: @escaping (_ state: String?, _ city: String?, _ country: String?) -> Void) {
-        self.completion = completion
-
-        guard Bundle.main.object(forInfoDictionaryKey: "NSLocationWhenInUseUsageDescription") != nil else {
-            PusherHub.log("NSLocationWhenInUseUsageDescription is missing from Info.plist — skipping state/city resolution.")
-            finish(nil, nil, nil)
-            return
-        }
-
-        timeoutTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 15_000_000_000)
-            guard !Task.isCancelled else { return }
-            PusherHub.log("Timed out waiting for a location fix — skipping state/city resolution.")
-            self?.finish(nil, nil, nil)
-        }
-
-        manager.delegate = self
-        manager.desiredAccuracy = kCLLocationAccuracyKilometer
-        handleAuthorization(manager.authorizationStatus)
-    }
-
-    private func handleAuthorization(_ status: CLAuthorizationStatus) {
-        switch status {
-        case .notDetermined:
-            awaitingAuthorization = true
-            manager.requestWhenInUseAuthorization()
-        case .authorizedWhenInUse, .authorizedAlways:
-            awaitingAuthorization = false
-            manager.requestLocation()
-        default:
-            PusherHub.log("Location permission denied — skipping state/city resolution.")
-            finish(nil, nil, nil)
-        }
-    }
-
-    nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
-        let status = manager.authorizationStatus
-        Task { @MainActor in
-            // Also fires once as soon as the delegate is set — only the
-            // answer to a prompt this resolver showed matters here.
-            guard awaitingAuthorization, status != .notDetermined else { return }
-            handleAuthorization(status)
-        }
-    }
-
-    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        guard let coordinate = locations.last?.coordinate else { return }
-        let latitude = coordinate.latitude
-        let longitude = coordinate.longitude
-        Task { @MainActor in geocode(latitude: latitude, longitude: longitude) }
-    }
-
-    nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
-        let description = error.localizedDescription
-        Task { @MainActor in
-            PusherHub.log("Location lookup failed (\(description)) — skipping state/city resolution.")
-            finish(nil, nil, nil)
-        }
-    }
-
-    private func geocode(latitude: Double, longitude: Double) {
-        guard completion != nil else { return }
-        geocoder.reverseGeocodeLocation(CLLocation(latitude: latitude, longitude: longitude)) { @Sendable placemarks, _ in
-            let placemark = placemarks?.first
-            let state = placemark?.administrativeArea
-            let city = placemark?.locality
-            let country = placemark?.country
-            Task { @MainActor [weak self] in self?.finish(state, city, country) }
-        }
-    }
-
-    private func finish(_ state: String?, _ city: String?, _ country: String?) {
-        guard let completion else { return }
-        self.completion = nil
-        timeoutTask?.cancel()
-        manager.delegate = nil
-        completion(state, city, country)
+    public init(state: String? = nil, city: String? = nil, country: String? = nil) {
+        self.state = state
+        self.city = city
+        self.country = country
     }
 }
 
@@ -1224,6 +1156,26 @@ private struct PusherHubInAppView: View {
     let message: InAppMessage
     let finish: (PusherHubInAppPresenter.Outcome) -> Void
 
+    var body: some View {
+        // The space inside the safe area, so a message stays clear of the
+        // notch, the Dynamic Island and the home indicator in any rotation.
+        GeometryReader { geometry in
+            PusherHubInAppLayout(message: message, size: geometry.size, finish: finish)
+        }
+    }
+}
+
+private struct PusherHubInAppLayout: View {
+    let message: InAppMessage
+    let size: CGSize
+    let finish: (PusherHubInAppPresenter.Outcome) -> Void
+
+    /// On a wide screen (a phone in landscape, an iPad) a card keeps a
+    /// readable width instead of stretching edge to edge — the same widths
+    /// as the other PusherHub SDKs.
+    private static let maxCardWidth: CGFloat = 560
+    private static let maxFullscreenWidth: CGFloat = 640
+
     @State private var htmlHeight: CGFloat = 280
 
     private var isFullscreen: Bool { message.type == "fullscreen" }
@@ -1231,14 +1183,26 @@ private struct PusherHubInAppView: View {
     private var textColor: Color { Color(pusherHubHex: message.textColor) ?? Color(red: 15 / 255, green: 23 / 255, blue: 42 / 255) }
     private var cardColor: Color { Color(pusherHubHex: message.backgroundColor) ?? .white }
 
+    private var isBanner: Bool { message.type == "banner" }
+    private var horizontalMargin: CGFloat { isBanner || message.type == "bottom_sheet" ? 12 : 24 }
+
+    /// A banner keeps most of the app visible; the rest may use the whole
+    /// height. Taller content scrolls inside the card — on a phone turned
+    /// sideways that's often all of it.
+    private var maxCardHeight: CGFloat {
+        max(0, isBanner ? size.height * 0.6 : size.height - 16)
+    }
+
+    /// Pictures shrink to fit (never cropped) so a wide card in landscape
+    /// still leaves room for the text and buttons.
+    private var maxImageHeight: CGFloat { size.height * (isFullscreen ? 0.5 : 0.4) }
+
     var body: some View {
-        GeometryReader { geometry in
-            ZStack(alignment: alignment) {
-                backdrop
-                card(maxHeight: geometry.size.height)
-            }
-            .frame(width: geometry.size.width, height: geometry.size.height)
+        ZStack(alignment: alignment) {
+            backdrop
+            card
         }
+        .frame(width: size.width, height: size.height)
     }
 
     private var alignment: Alignment {
@@ -1265,23 +1229,33 @@ private struct PusherHubInAppView: View {
     }
 
     @ViewBuilder
-    private func card(maxHeight: CGFloat) -> some View {
+    private var card: some View {
         if isHTML {
-            htmlCard(maxHeight: maxHeight)
+            htmlCard
         } else if isFullscreen {
-            nativeContent
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(backgroundImage.ignoresSafeArea())
-                .overlay(alignment: .topTrailing) { closeButton }
+            ScrollView(.vertical) {
+                nativeContent
+                    .frame(maxWidth: Self.maxFullscreenWidth)
+                    // Short content sits in the middle of the screen; taller
+                    // content scrolls.
+                    .frame(maxWidth: .infinity, minHeight: size.height)
+            }
+            .pusherHubBounceOnlyWhenScrollable()
+            .frame(width: size.width, height: size.height)
+            .background(backgroundImage.ignoresSafeArea())
+            .overlay(alignment: .topTrailing) { closeButton }
         } else {
-            nativeContent
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(ZStack { cardColor; backgroundImage })
-                .overlay(alignment: .topTrailing) { closeButton }
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .shadow(color: .black.opacity(0.18), radius: 16, y: 4)
-                .padding(.horizontal, message.type == "banner" || message.type == "bottom_sheet" ? 12 : 24)
-                .padding(.vertical, 8)
+            PusherHubFitScroll(maxHeight: maxCardHeight) {
+                nativeContent
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .background(ZStack { cardColor; backgroundImage })
+            .overlay(alignment: .topTrailing) { closeButton }
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .shadow(color: .black.opacity(0.18), radius: 16, y: 4)
+            .frame(maxWidth: Self.maxCardWidth)
+            .padding(.horizontal, horizontalMargin)
+            .padding(.vertical, 8)
         }
     }
 
@@ -1441,14 +1415,17 @@ private struct PusherHubInAppView: View {
     }
 
     /// The whole image at its natural aspect ratio — no crop, no
-    /// letterboxing — matching the dashboard preview's <img class="w-full">.
+    /// letterboxing — matching the dashboard preview's <img class="w-full">,
+    /// up to maxImageHeight: a taller picture shrinks to fit, centered.
     private func remoteImage(_ urlString: String) -> some View {
         AsyncImage(url: URL(string: urlString)) { image in
             image.resizable().scaledToFit()
         } placeholder: {
             Color.clear.frame(height: 0)
         }
-        .frame(maxWidth: .infinity)
+        // The ideal height is what a scrolling card offers the picture, so
+        // the cap holds there too.
+        .frame(maxWidth: .infinity, idealHeight: maxImageHeight, maxHeight: maxImageHeight)
     }
 
     /// Painted behind the content rather than taking up space in the flow,
@@ -1468,7 +1445,7 @@ private struct PusherHubInAppView: View {
     // MARK: HTML
 
     @ViewBuilder
-    private func htmlCard(maxHeight: CGFloat) -> some View {
+    private var htmlCard: some View {
         let web = PusherHubHTMLView(html: message.htmlContent ?? "") { event in
             switch event {
             case .close: finish(.closed)
@@ -1484,10 +1461,56 @@ private struct PusherHubInAppView: View {
             // Sized to the page's own height (reported from inside it), up
             // to most of the screen — taller pages scroll.
             web
-                .frame(height: min(htmlHeight, maxHeight * 0.85))
+                .frame(height: min(htmlHeight, isBanner ? maxCardHeight : size.height * 0.85))
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .padding(.horizontal, message.type == "banner" || message.type == "bottom_sheet" ? 12 : 24)
+                .frame(maxWidth: Self.maxCardWidth)
+                .padding(.horizontal, horizontalMargin)
                 .padding(.vertical, 8)
+        }
+    }
+}
+
+/**
+ * A card's content at its own height, scrolling once it would pass
+ * [maxHeight] — so a short message stays a small card and a long one (or
+ * any message on a phone turned sideways) never runs off the screen.
+ */
+private struct PusherHubFitScroll<Content: View>: View {
+    let maxHeight: CGFloat
+    @ViewBuilder let content: Content
+
+    @State private var contentHeight: CGFloat = 0
+
+    var body: some View {
+        ScrollView(.vertical) {
+            content.background(
+                GeometryReader { proxy in
+                    Color.clear.preference(key: PusherHubContentHeightKey.self, value: proxy.size.height)
+                }
+            )
+        }
+        .pusherHubBounceOnlyWhenScrollable()
+        .frame(height: min(contentHeight, maxHeight))
+        .onPreferenceChange(PusherHubContentHeightKey.self) { contentHeight = $0 }
+    }
+}
+
+private struct PusherHubContentHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+private extension View {
+    /// No rubber-band bounce on content that already fits (iOS 16.4+).
+    @ViewBuilder
+    func pusherHubBounceOnlyWhenScrollable() -> some View {
+        if #available(iOS 16.4, *) {
+            scrollBounceBehavior(.basedOnSize)
+        } else {
+            self
         }
     }
 }

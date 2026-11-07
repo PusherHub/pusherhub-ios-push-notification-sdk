@@ -10,14 +10,15 @@ Push notifications and in-app messages for your iPhone app: a free push notifica
 - Links a phone to your own user id with `login(externalId:)` — remembered across restarts until `logout()`
 - Reports notification opens and clicks
 - Hands your app each tapped notification's Custom Data, so you can open the right screen
-- Shows in-app messages in SwiftUI with `.pusherHubMessageHost()`
+- Shows in-app messages in SwiftUI with `.pusherHubMessageHost()`, fitted to portrait and landscape screens
 - Images in notifications, with the included Notification Service Extension
-- Optional device details, and GPS-accurate state and city if you turn location on
+- No location code and no location permission: state and city come from the phone's IP address, and an app that already uses location can add the optional `PusherHubLocation.swift` for GPS-accurate state and city
 
 | File | What it's for |
 |---|---|
 | [`PusherHub.swift`](PusherHub.swift) | The SDK — add it to your app target |
 | [`NotificationService/NotificationService.swift`](NotificationService/NotificationService.swift) | Optional — shows images in notifications |
+| [`PusherHubLocation.swift`](PusherHubLocation.swift) | Optional — only for an app that already uses location |
 
 ## Before you start
 
@@ -80,7 +81,7 @@ struct YourApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
-                // Optional: shows in-app messages.
+                // Shows in-app messages. Keep it, or they never appear.
                 .pusherHubMessageHost()
         }
     }
@@ -92,6 +93,20 @@ struct YourApp: App {
 1. Xcode › *File › New › Target…* › **Notification Service Extension**, named `NotificationService`.
 2. Set its minimum iOS version to match your app.
 3. Replace the generated `NotificationService.swift` with [this one](NotificationService/NotificationService.swift).
+
+## Location (only if your app already uses it)
+
+PusherHub finds each phone's state and city from its IP address, so most apps skip this. Don't add location access just for PusherHub: the App Store then asks you to explain why your app uses location.
+
+An app that already asks for location (its `Info.plist` already has `NSLocationWhenInUseUsageDescription`) can add [`PusherHubLocation.swift`](PusherHubLocation.swift) next to `PusherHub.swift` and pass it in:
+
+```swift
+PusherHub.registerDevice {
+    PusherHub.collectDeviceMetadata(location: PusherHubLocation.place)
+}
+```
+
+It never asks for permission: it reads the location only when the person has already allowed it for your app.
 
 ## Opening a screen when a notification is tapped
 
